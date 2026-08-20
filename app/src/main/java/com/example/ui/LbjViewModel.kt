@@ -1,0 +1,501 @@
+package com.example.ui
+
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import com.example.data.LbjDatabase
+import com.example.data.RouteStationKmEntity
+import com.example.data.TrainRecord
+import com.example.decoder.ArrivalEstimator
+import com.example.decoder.EtaInfo
+import com.example.decoder.LbjDecoder
+import com.example.decoder.TrainTelemetry
+import com.example.driver.DriverLauncher
+import com.example.driver.RtlTcpClient
+import com.example.driver.SignalSimulator
+import com.example.dsp.DspConstants
+import com.example.dsp.DspFrontend
+import com.example.dsp.FftProcessor
+import com.example.dsp.RssiGate
+import com.example.util.SoundAlertManager
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+data class ReceiverState(
+    val isRunning: Boolean = false,
+    val isSimulationMode: Boolean = false,
+    val connectionState: RtlTcpClient.ConnectionState = RtlTcpClient.ConnectionState.IDLE,
+    val host: String = "127.0.0.1",
+    val port: Int = 1234,
+    val freqHz: Double = DspConstants.DEFAULT_FREQ_HZ,
+    val gainDb: Float = DspConstants.HW_GAIN_DB,
+    val ppm: Int = DspConstants.PPM,
+    val dcOffsetHz: Double = DspConstants.DEFAULT_DC_OFFSET_HZ,
+    val bwKhz: Double = DspConstants.DEFAULT_BW_KHZ,
+    val rssiDb: Float = -120.0f,
+    val csThresholdDb: Float = DspConstants.DEFAULT_RSSI_THRESHOLD_DB,
+    val rssiGateState: String = "OFF",
+    val rssiHoldMs: Float = 0.0f,
+    val afcHz: Double = 0.0,
+    val afcErrHz: Double = 0.0,
+    val afcScore: Double = 0.0,
+    val afcEnabled: Boolean = true,
+    val strictFilter: Boolean = true,
+    val showErrWarn: Boolean = true,
+    val filterMode: String = "highlight",
+    val keywords: List<String> = emptyList(),
+    val warningMessage: String = "",
+    val warningTime: Long = 0L,
+    val broadcastAlerts: Boolean = true,
+    val alertToneEnabled: Boolean = false,
+    val showSimulationButton: Boolean = false,
+    val showSignalLossDialog: Boolean = false,
+    val spectrumBars: FloatArray = FloatArray(32) { -120.0f },
+    val peakFreqHz: Double? = null,
+    val peakDeltaHz: Double? = null,
+    val peakDb: Float? = null,
+    val currentRouteStationKmText: String = "---"
+)
+
+class LbjViewModel(application: Application) : AndroidViewModel(application) {
+
+    private val db = LbjDatabase.getDatabase(application)
+    private val dao = db.lbjDao()
+
+    val historyRecords = dao.getAllTrainRecords()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val savedRouteKms = dao.getAllRouteStationKms()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    private val _receiverState = MutableStateFlow(ReceiverState())
+    val receiverState: StateFlow<ReceiverState> = _receiverState.asStateFlow()
+
+    private val _liveTelemetry = MutableStateFlow(TrainTelemetry())
+    val liveTelemetry: StateFlow<TrainTelemetry> = _liveTelemetry.asStateFlow()
+
+    private val _liveEta = MutableStateFlow(EtaInfo())
+    val liveEta: StateFlow<EtaInfo> = _liveEta.asStateFlow()
+
+    private val arrivalEstimator = ArrivalEstimator()
+    private val rssiGate = RssiGate()
+    private val fftProcessor = FftProcessor()
+    private val simulator = SignalSimulator()
+
+    private var dspFrontend = DspFrontend(
+        sampleRate = DspConstants.RTL_SAMPLE_RATE.toDouble(),
+        dcOffset = DspConstants.DEFAULT_DC_OFFSET_HZ,
+        bwHz = DspConstants.DEFAULT_BW_KHZ * 1000.0,
+        afcEnable = true
+    )
+
+    private val rtlClient = RtlTcpClient(
+        initialFreqHz = DspConstants.DEFAULT_FREQ_HZ,
+        dcOffsetHz = DspConstants.DEFAULT_DC_OFFSET_HZ,
+        initialGainDb = DspConstants.HW_GAIN_DB,
+        initialPpm = DspConstants.PPM
+    )
+
+    private val decoder = LbjDecoder(
+        arrivalEstimator = arrivalEstimator,
+        strictFilter = true,
+        showErrWarn = true,
+        filterMode = "highlight",
+        keywords = emptyList()
+    )
+
+    private var dspJob: Job? = null
+    private var lastRecordedTrainKey = ""
+    private var lastRecordedTime = 0L
+
+    private var lastPeakValue: Float? = null
+    private var lastPeakChangeTime: Long = 0L
+    private var hasShownSignalLossDialog: Boolean = false
+
+    private val soundAlertManager = SoundAlertManager(viewModelScope)
+    private var lastDecodedTrainNo: String = ""
+    private var lastAlertPlayTime: Long = 0L
+
+    init {
+        // Load initial route KM mappings from Room
+        viewModelScope.launch(Dispatchers.IO) {
+            val list = dao.getAllRouteStationKmsList()
+            for (item in list) {
+                arrivalEstimator.setRouteKm(item.routeName, item.stationKm)
+            }
+        }
+
+        // Configure decoder callbacks
+        decoder.onTelemetryUpdated = { telemetry, eta ->
+            _liveTelemetry.value = telemetry
+            _liveEta.value = eta
+
+            // Play 2-second alert tone on train signal decode or train change if enabled
+            if (_receiverState.value.alertToneEnabled && telemetry.trainNo != "----") {
+                val now = System.currentTimeMillis()
+                val isTrainChanged = (lastDecodedTrainNo.isNotEmpty() && lastDecodedTrainNo != telemetry.trainNo)
+                val isNewSignal = (lastDecodedTrainNo.isEmpty() || (now - lastAlertPlayTime > 4000L))
+
+                if (isTrainChanged || isNewSignal) {
+                    lastDecodedTrainNo = telemetry.trainNo
+                    lastAlertPlayTime = now
+                    soundAlertManager.playAlertTone()
+                }
+            }
+
+            // Send Android broadcast if enabled
+            if (_receiverState.value.broadcastAlerts && telemetry.trainNo != "----") {
+                DriverLauncher.sendAlertBroadcast(
+                    getApplication(),
+                    train = telemetry.trainNo,
+                    direction = telemetry.direction,
+                    speed = telemetry.speed,
+                    position = telemetry.positionKm,
+                    loco = telemetry.locoModel,
+                    locoCode = telemetry.locoCode,
+                    route = telemetry.route,
+                    category = telemetry.category
+                )
+            }
+
+            // Persist to Room database if new packet or position updated
+            val trainKey = "${telemetry.trainNo}_${telemetry.direction}_${telemetry.positionKm}_${telemetry.speed}"
+            val now = System.currentTimeMillis()
+            if (trainKey != lastRecordedTrainKey || (now - lastRecordedTime > 15000)) {
+                lastRecordedTrainKey = trainKey
+                lastRecordedTime = now
+                viewModelScope.launch(Dispatchers.IO) {
+                    dao.insertTrainRecord(
+                        TrainRecord(
+                            timestamp = now,
+                            trainNo = telemetry.trainNo,
+                            direction = telemetry.direction,
+                            speed = telemetry.speed,
+                            positionKm = telemetry.positionKm,
+                            locoModel = telemetry.locoModel,
+                            locoCode = telemetry.locoCode,
+                            route = telemetry.route,
+                            category = telemetry.category,
+                            rssiDb = _receiverState.value.rssiDb,
+                            rawBcd = telemetry.rawBcd
+                        )
+                    )
+                }
+            }
+        }
+
+        decoder.onWarning = { warn ->
+            val now = System.currentTimeMillis()
+            _receiverState.value = _receiverState.value.copy(
+                warningMessage = warn,
+                warningTime = now
+            )
+        }
+
+        rtlClient.onStateChanged = { state, error ->
+            _receiverState.value = _receiverState.value.copy(
+                connectionState = state,
+                warningMessage = error ?: _receiverState.value.warningMessage
+            )
+        }
+    }
+
+    fun startReceiver(isSimulation: Boolean = false) {
+        if (_receiverState.value.isRunning) {
+            stopReceiver()
+        }
+
+        hasShownSignalLossDialog = false
+        lastPeakValue = null
+        lastPeakChangeTime = System.currentTimeMillis()
+
+        if (isSimulation) {
+            simulator.resetSimulation()
+        }
+
+        _receiverState.value = _receiverState.value.copy(
+            isRunning = true,
+            isSimulationMode = isSimulation,
+            showSignalLossDialog = false,
+            warningMessage = if (isSimulation) "已开启 RF 信号仿真流演示模式 (每5秒模拟报文)" else ""
+        )
+
+        if (!isSimulation) {
+            rtlClient.open()
+        }
+
+        dspJob = viewModelScope.launch(Dispatchers.Default) {
+            runDspLoop(isSimulation)
+        }
+    }
+
+    fun stopReceiver() {
+        dspJob?.cancel()
+        dspJob = null
+        rtlClient.close()
+        lastDecodedTrainNo = ""
+        _receiverState.value = _receiverState.value.copy(
+            isRunning = false,
+            spectrumBars = FloatArray(32) { -120.0f },
+            peakFreqHz = null,
+            peakDeltaHz = null,
+            peakDb = null,
+            rssiDb = -120.0f,
+            rssiGateState = "OFF",
+            rssiHoldMs = 0.0f,
+            afcHz = 0.0,
+            afcErrHz = 0.0,
+            afcScore = 0.0
+        )
+    }
+
+    fun dismissSignalLossDialog() {
+        _receiverState.value = _receiverState.value.copy(showSignalLossDialog = false)
+    }
+
+    private suspend fun runDspLoop(isSimulation: Boolean) {
+        val resetAfcOnRelease = true
+
+        while (viewModelScope.isActive && _receiverState.value.isRunning) {
+            val iq = if (isSimulation) {
+                delay(65) // match 65536 samples @ 960kS/s (~68ms)
+                simulator.generateBlock()
+            } else {
+                val block = withContext(Dispatchers.IO) {
+                    rtlClient.readBlock(200)
+                }
+                if (block == null) {
+                    val nowMs = System.currentTimeMillis()
+                    if (nowMs - lastPeakChangeTime >= 3000L && !hasShownSignalLossDialog && !_receiverState.value.isSimulationMode) {
+                        hasShownSignalLossDialog = true
+                        _receiverState.value = _receiverState.value.copy(showSignalLossDialog = true)
+                    }
+                    delay(10)
+                    continue
+                }
+                block
+            }
+
+            if (!viewModelScope.isActive || !_receiverState.value.isRunning) {
+                break
+            }
+
+            // 1. Process FFT & spectrum
+            val curState = _receiverState.value
+            val hwFreq = curState.freqHz - curState.dcOffsetHz
+            val fftRes = fftProcessor.process(
+                iqBuffer = iq,
+                sampleRate = DspConstants.RTL_SAMPLE_RATE.toDouble(),
+                hwFreqHz = hwFreq,
+                targetFreqHz = curState.freqHz,
+                bwKhz = curState.bwKhz
+            )
+
+            // Detect peak freeze in real SDR reception mode (3 seconds with no change)
+            if (!isSimulation) {
+                val curPeak = fftRes.peakInfo.peakDb
+                val nowMs = System.currentTimeMillis()
+                if (curPeak == null || lastPeakValue == null || kotlin.math.abs(curPeak - (lastPeakValue ?: 0f)) > 0.001f) {
+                    lastPeakValue = curPeak
+                    lastPeakChangeTime = nowMs
+                } else {
+                    if (nowMs - lastPeakChangeTime >= 3000L && !hasShownSignalLossDialog) {
+                        hasShownSignalLossDialog = true
+                        _receiverState.value = _receiverState.value.copy(showSignalLossDialog = true)
+                    }
+                }
+            }
+
+            // 2. Process DSP frontend chain
+            val dspRes = dspFrontend.process(iq, rssiGate)
+
+            // 3. Check AFC update
+            if (dspFrontend.consumeAfcUpdated()) {
+                decoder.resetDpllSoft()
+            }
+
+            // 4. Feed baseband PCM to slicer & decoder
+            if (dspRes.rxActive) {
+                decoder.processAudioChunk(dspRes.pcmFloat)
+            } else if (rssiGate.justDeactivated) {
+                decoder.resetReceiverState()
+                if (resetAfcOnRelease && dspFrontend.afc.enabled) {
+                    dspFrontend.resetAfc()
+                }
+            }
+
+            if (!viewModelScope.isActive || !_receiverState.value.isRunning) {
+                break
+            }
+
+            if (!isSimulation) {
+                rtlClient.recycleBuffer(iq)
+            }
+
+            // Update UI state
+            val curRoute = _liveTelemetry.value.route
+            val routeKm = arrivalEstimator.getKmForRoute(curRoute)
+            val routeKmText = if (routeKm != null) ArrivalEstimator.formatKm(routeKm) else "未设置"
+
+            _receiverState.value = _receiverState.value.copy(
+                rssiDb = dspRes.rssiDb,
+                rssiGateState = rssiGate.state,
+                rssiHoldMs = rssiGate.holdLeftMs,
+                afcHz = dspFrontend.afc.afcHz,
+                afcErrHz = dspFrontend.afc.lastErrHz,
+                afcScore = dspFrontend.afc.lastScore,
+                spectrumBars = fftRes.bandsDb,
+                peakFreqHz = fftRes.peakInfo.peakFreqHz,
+                peakDeltaHz = fftRes.peakInfo.peakDeltaHz,
+                peakDb = fftRes.peakInfo.peakDb,
+                currentRouteStationKmText = routeKmText
+            )
+        }
+    }
+
+    // Tuning controls
+    fun setFrequency(freqMhz: Double) {
+        val freqHz = freqMhz * 1_000_000.0
+        _receiverState.value = _receiverState.value.copy(freqHz = freqHz)
+        rtlClient.setFrequency(freqHz)
+        dspFrontend.resetAfc()
+        rssiGate.reset()
+    }
+
+    fun setGain(gainDb: Float) {
+        _receiverState.value = _receiverState.value.copy(gainDb = gainDb)
+        rtlClient.setGain(gainDb)
+    }
+
+    fun setPpm(ppm: Int) {
+        _receiverState.value = _receiverState.value.copy(ppm = ppm)
+        rtlClient.setPpm(ppm)
+        dspFrontend.resetAfc()
+        rssiGate.reset()
+    }
+
+    fun setCsThreshold(thresholdDb: Float) {
+        _receiverState.value = _receiverState.value.copy(csThresholdDb = thresholdDb)
+        rssiGate.setThreshold(thresholdDb)
+    }
+
+    fun setStrictFilter(enabled: Boolean) {
+        _receiverState.value = _receiverState.value.copy(strictFilter = enabled)
+        decoder.strictFilter = enabled
+    }
+
+    fun setShowErrWarn(enabled: Boolean) {
+        _receiverState.value = _receiverState.value.copy(showErrWarn = enabled)
+        decoder.showErrWarn = enabled
+    }
+
+    fun setFilterMode(mode: String) {
+        _receiverState.value = _receiverState.value.copy(filterMode = mode)
+        decoder.filterMode = mode
+    }
+
+    fun setKeywords(kwList: List<String>) {
+        _receiverState.value = _receiverState.value.copy(keywords = kwList)
+        decoder.keywords = kwList
+    }
+
+    fun setBroadcastAlerts(enabled: Boolean) {
+        _receiverState.value = _receiverState.value.copy(broadcastAlerts = enabled)
+    }
+
+    fun setAlertToneEnabled(enabled: Boolean) {
+        _receiverState.value = _receiverState.value.copy(alertToneEnabled = enabled)
+    }
+
+    fun setShowSimulationButton(enabled: Boolean) {
+        _receiverState.value = _receiverState.value.copy(showSimulationButton = enabled)
+    }
+
+    fun resetAllSettings() {
+        setFrequency(DspConstants.DEFAULT_FREQ_HZ / 1_000_000.0)
+        setGain(DspConstants.HW_GAIN_DB)
+        setPpm(DspConstants.PPM)
+        setCsThreshold(DspConstants.DEFAULT_RSSI_THRESHOLD_DB)
+        setStrictFilter(true)
+        setShowErrWarn(true)
+        setFilterMode("highlight")
+        setKeywords(emptyList())
+        setBroadcastAlerts(true)
+        setAlertToneEnabled(false)
+        setShowSimulationButton(false)
+    }
+
+    fun setRouteStationKm(routeName: String, stationKm: Double) {
+        arrivalEstimator.setRouteKm(routeName, stationKm)
+        viewModelScope.launch(Dispatchers.IO) {
+            dao.insertRouteStationKm(
+                RouteStationKmEntity(
+                    routeName = routeName,
+                    stationKm = stationKm,
+                    updatedTimestamp = System.currentTimeMillis()
+                )
+            )
+        }
+    }
+
+    fun deleteRouteStationKm(routeName: String) {
+        arrivalEstimator.removeRouteKm(routeName)
+        viewModelScope.launch(Dispatchers.IO) {
+            dao.deleteRouteStationKm(routeName)
+        }
+    }
+
+    fun clearLiveTelemetry() {
+        lastDecodedTrainNo = ""
+        _liveTelemetry.value = TrainTelemetry()
+        _liveEta.value = EtaInfo()
+    }
+
+    fun clearHistory() {
+        viewModelScope.launch(Dispatchers.IO) {
+            dao.clearAllTrainRecords()
+        }
+    }
+
+    fun deleteHistoryRecord(id: Long) {
+        viewModelScope.launch(Dispatchers.IO) {
+            dao.deleteTrainRecord(id)
+        }
+    }
+
+    fun launchAndroidDriver() {
+        val state = _receiverState.value
+        val ok = DriverLauncher.startRtlDriver(
+            context = getApplication(),
+            host = state.host,
+            port = state.port,
+            sampleRate = DspConstants.RTL_SAMPLE_RATE,
+            freqHz = state.freqHz.toLong()
+        )
+        if (!ok) {
+            _receiverState.value = _receiverState.value.copy(
+                warningMessage = "未找到 RTL-SDR 驱动应用，请安装 RTL-SDR Driver 或开启仿真演示模式。"
+            )
+        }
+    }
+
+    fun openDriverAppSettings() {
+        DriverLauncher.openDriverAppSettings(getApplication())
+    }
+
+
+    override fun onCleared() {
+        super.onCleared()
+        stopReceiver()
+        soundAlertManager.release()
+    }
+}
