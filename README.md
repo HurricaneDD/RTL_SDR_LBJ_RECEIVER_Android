@@ -1,4 +1,5 @@
 # RTL SDR_LBJ_RECEIVER_Android
+[点击下载APK文件](https://hurricanedd.github.io/RTL_SDR_LBJ_RECEIVER_Android/SDR-LBJ-Receiver-debug.apk)
 ## 致谢和免责
 本项目参考了 [FLN1021/SX1276_Receive_LBJ](https://github.com/Sdr-Is-Fun/RTL_SDR_LBJ_RECEIVER/tree/main)，使用了Google Gemini 模型进行开发。
 
