@@ -19,6 +19,7 @@ import androidx.compose.material.icons.filled.HelpOutline
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -161,6 +162,9 @@ fun SpectrumWaterfallView(
 
             Spacer(modifier = Modifier.height(10.dp))
 
+            val gradientColors = remember { listOf(Color(0xFF38BDF8), Color(0xFF10B981), Color(0xFF047857)) }
+            val gridDbs = remember { floatArrayOf(-90f, -70f, -50f) }
+
             // 32-band FFT Spectrum Canvas
             Canvas(
                 modifier = Modifier
@@ -184,13 +188,12 @@ fun SpectrumWaterfallView(
                 val barWidth = max(2f, (canvasWidth - totalSpacing) / numBars)
 
                 val gradientBrush = Brush.verticalGradient(
-                    colors = listOf(Color(0xFF38BDF8), Color(0xFF10B981), Color(0xFF047857)),
+                    colors = gradientColors,
                     startY = 0f,
                     endY = canvasHeight
                 )
 
                 // Draw grid lines (-90dB, -70dB, -50dB)
-                val gridDbs = floatArrayOf(-90f, -70f, -50f)
                 for (gDb in gridDbs) {
                     val normY = (1.0f - (gDb - minDb) / dbRange).coerceIn(0f, 1f)
                     val yPos = normY * canvasHeight

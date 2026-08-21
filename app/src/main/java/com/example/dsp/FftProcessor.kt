@@ -5,34 +5,62 @@ import kotlin.math.cos
 import kotlin.math.log10
 import kotlin.math.max
 import kotlin.math.sin
-import kotlin.math.sqrt
 
+/**
+ * Ultra-fast Radix-2 FFT Processor with precomputed Twiddle and Bit-Reversal Tables.
+ * Zero-allocations during process execution for maximum performance on older Android CPUs.
+ */
 class FftProcessor(
-    val fftSize: Int = 1024,
+    val fftSize: Int = 512,
     val numBands: Int = 32
 ) {
     private val hanningWindow = FloatArray(fftSize) { i ->
         (0.5 * (1.0 - cos(2.0 * PI * i / (fftSize - 1)))).toFloat()
     }
-    private val winMean: Float
+    private val invScaleSq: Double
+
+    // Precomputed Bit-Reversal and Twiddle tables
+    private val bitRev = IntArray(fftSize)
+    private val cosTwiddle = FloatArray(fftSize / 2)
+    private val sinTwiddle = FloatArray(fftSize / 2)
+
     private val realBuf = FloatArray(fftSize)
     private val imagBuf = FloatArray(fftSize)
     private val fullDbBuf = FloatArray(fftSize)
-    private val pooledBuf = FloatArray(numBands)
-    private val barsOutput = FloatArray(numBands)
+    val smoothedBars = FloatArray(numBands) { -120.0f }
+    private val bandsOutput = FloatArray(numBands)
 
     init {
         var sum = 0.0
         for (w in hanningWindow) sum += w
-        winMean = (sum / fftSize).toFloat()
+        val winMean = (sum / fftSize).toFloat()
+        val scale = (fftSize * winMean).toDouble()
+        invScaleSq = 1.0 / (scale * scale)
+
+        // Precompute bit reversal permutation
+        var j = 0
+        for (i in 0 until fftSize) {
+            bitRev[i] = j
+            var k = fftSize shr 1
+            while (k <= j && k > 0) {
+                j -= k
+                k = k shr 1
+            }
+            j += k
+        }
+
+        // Precompute twiddle factors: W_N^k = e^(-2*pi*j*k/N)
+        for (k in 0 until fftSize / 2) {
+            val angle = -2.0 * PI * k / fftSize
+            cosTwiddle[k] = cos(angle).toFloat()
+            sinTwiddle[k] = sin(angle).toFloat()
+        }
     }
 
-    val smoothedBars = FloatArray(numBands) { -120.0f }
-
     data class PeakInfo(
-        val peakFreqHz: Double?,
-        val peakDeltaHz: Double?,
-        val peakDb: Float?
+        var peakFreqHz: Double? = null,
+        var peakDeltaHz: Double? = null,
+        var peakDb: Float? = null
     )
 
     data class FftResult(
@@ -40,6 +68,9 @@ class FftProcessor(
         val fullSpectrumDb: FloatArray,
         val peakInfo: PeakInfo
     )
+
+    private val cachedPeakInfo = PeakInfo()
+    private val cachedResult = FftResult(bandsOutput, fullDbBuf, cachedPeakInfo)
 
     /**
      * Compute FFT on the first `fftSize` complex samples.
@@ -53,133 +84,115 @@ class FftProcessor(
     ): FftResult {
         val n = fftSize
         if (iqBuffer.size < n) {
-            return FftResult(smoothedBars.clone(), FloatArray(n) { -120f }, PeakInfo(null, null, null))
+            return cachedResult
         }
 
-        // Apply Hanning window
+        // 1. Apply Hanning window with bit-reversal reordering directly
         val real = realBuf
         val imag = imagBuf
-        for (i in 0 until n) {
-            val w = hanningWindow[i]
-            real[i] = iqBuffer.real[i] * w
-            imag[i] = iqBuffer.imag[i] * w
-        }
-
-        // Perform in-place Cooley-Tukey Radix-2 FFT
-        fftRadix2(real, imag, n)
-
-        // FFT Shift (swap halves) and compute magnitude in dB
-        val fullDb = fullDbBuf
-        val half = n / 2
-        val scale = n * winMean
+        val inR = iqBuffer.real
+        val inI = iqBuffer.imag
+        val w = hanningWindow
+        val brev = bitRev
 
         for (i in 0 until n) {
-            val srcIdx = (i + half) % n
-            val r = real[srcIdx]
-            val im = imag[srcIdx]
-            val mag = sqrt(r * r + im * im) / scale
-            val db = (20.0 * log10(max(1e-12, mag.toDouble()))).toFloat()
-            fullDb[i] = db
+            val src = brev[i]
+            val win = w[src]
+            real[i] = inR[src] * win
+            imag[i] = inI[src] * win
         }
 
-        // Pool into numBands
+        // 2. Perform Cooley-Tukey Radix-2 FFT using precomputed Twiddle factors
+        var len = 2
+        while (len <= n) {
+            val halfLen = len shr 1
+            val stepTwiddle = n / len
+
+            var i = 0
+            while (i < n) {
+                for (k in 0 until halfLen) {
+                    val twIdx = k * stepTwiddle
+                    val wR = cosTwiddle[twIdx]
+                    val wI = sinTwiddle[twIdx]
+
+                    val idx1 = i + k
+                    val idx2 = idx1 + halfLen
+
+                    val vR2 = real[idx2]
+                    val vI2 = imag[idx2]
+                    val vR = vR2 * wR - vI2 * wI
+                    val vI = vR2 * wI + vI2 * wR
+
+                    val uR = real[idx1]
+                    val uI = imag[idx1]
+
+                    real[idx1] = uR + vR
+                    imag[idx1] = uI + vI
+                    real[idx2] = uR - vR
+                    imag[idx2] = uI - vI
+                }
+                i += len
+            }
+            len = len shl 1
+        }
+
+        // 3. FFT Shift and linear power calculation: pwr = (r*r + im*im) * invScaleSq
+        val half = n shr 1
+
+        // 4. Pool into numBands in linear power domain first (saves 480 log10 calls per block)
         val chunkSize = n / numBands
         for (b in 0 until numBands) {
-            var maxV = -999.0f
+            var maxPwr = 1e-12
             val start = b * chunkSize
-            val end = (b + 1) * chunkSize
+            val end = start + chunkSize
             for (k in start until end) {
-                if (fullDb[k] > maxV) maxV = fullDb[k]
+                val srcIdx = if (k < half) k + half else k - half
+                val r = real[srcIdx]
+                val im = imag[srcIdx]
+                val pwr = (r * r + im * im).toDouble() * invScaleSq
+                if (pwr > maxPwr) maxPwr = pwr
             }
-            // Exponential smoothing
-            smoothedBars[b] = 0.7f * smoothedBars[b] + 0.3f * maxV
-            barsOutput[b] = smoothedBars[b]
+            val bandDb = (10.0 * log10(maxPwr)).toFloat()
+            val smoothed = 0.65f * smoothedBars[b] + 0.35f * bandDb
+            smoothedBars[b] = smoothed
+            bandsOutput[b] = smoothed
         }
 
-        // Peak detector within target channel bandwidth
+        // 5. Peak detector within target channel bandwidth in linear domain
         val targetOffsetHz = targetFreqHz - hwFreqHz
         val targetBwHz = max(1000.0, bwKhz * 1000.0)
         val minOffset = targetOffsetHz - targetBwHz * 0.5
         val maxOffset = targetOffsetHz + targetBwHz * 0.5
 
         var peakIdx = -1
-        var peakVal = -999.0f
-        for (i in 0 until n) {
-            // frequency for shifted index i
-            // index 0 -> -sampleRate/2, index half -> 0, index n-1 -> sampleRate/2
-            val freqOffset = ((i - half).toDouble() / n) * sampleRate
-            if (freqOffset in minOffset..maxOffset) {
-                if (fullDb[i] > peakVal) {
-                    peakVal = fullDb[i]
-                    peakIdx = i
-                }
+        var peakPwr = 1e-12
+        val freqPerBin = sampleRate / n
+        val minBin = ((minOffset / freqPerBin) + half).toInt().coerceIn(0, n - 1)
+        val maxBin = ((maxOffset / freqPerBin) + half).toInt().coerceIn(0, n - 1)
+
+        for (i in minBin..maxBin) {
+            val srcIdx = if (i < half) i + half else i - half
+            val r = real[srcIdx]
+            val im = imag[srcIdx]
+            val pwr = (r * r + im * im).toDouble() * invScaleSq
+            if (pwr > peakPwr) {
+                peakPwr = pwr
+                peakIdx = i
             }
         }
 
-        val peakInfo = if (peakIdx >= 0) {
-            val peakFreqOffset = ((peakIdx - half).toDouble() / n) * sampleRate
+        if (peakIdx >= 0) {
+            val peakFreqOffset = (peakIdx - half) * freqPerBin
             val peakFreq = hwFreqHz + peakFreqOffset
-            PeakInfo(
-                peakFreqHz = peakFreq,
-                peakDeltaHz = peakFreq - targetFreqHz,
-                peakDb = peakVal
-            )
+            cachedPeakInfo.peakFreqHz = peakFreq
+            cachedPeakInfo.peakDeltaHz = peakFreq - targetFreqHz
+            cachedPeakInfo.peakDb = (10.0 * log10(peakPwr)).toFloat()
         } else {
-            PeakInfo(null, null, null)
+            cachedPeakInfo.peakFreqHz = null
+            cachedPeakInfo.peakDeltaHz = null
+            cachedPeakInfo.peakDb = null
         }
 
-        return FftResult(smoothedBars.clone(), fullDb, peakInfo)
-    }
-
-    private fun fftRadix2(real: FloatArray, imag: FloatArray, n: Int) {
-        var j = 0
-        for (i in 0 until n - 1) {
-            if (i < j) {
-                val tempR = real[i]
-                val tempI = imag[i]
-                real[i] = real[j]
-                imag[i] = imag[j]
-                real[j] = tempR
-                imag[j] = tempI
-            }
-            var k = n / 2
-            while (k <= j) {
-                j -= k
-                k /= 2
-            }
-            j += k
-        }
-
-        var len = 2
-        while (len <= n) {
-            val halfLen = len / 2
-            val angle = -2.0 * PI / len
-            val wStepR = cos(angle).toFloat()
-            val wStepI = sin(angle).toFloat()
-
-            var i = 0
-            while (i < n) {
-                var wR = 1.0f
-                var wI = 0.0f
-                for (k in 0 until halfLen) {
-                    val uR = real[i + k]
-                    val uI = imag[i + k]
-                    val vR = real[i + k + halfLen] * wR - imag[i + k + halfLen] * wI
-                    val vI = real[i + k + halfLen] * wI + imag[i + k + halfLen] * wR
-
-                    real[i + k] = uR + vR
-                    imag[i + k] = uI + vI
-                    real[i + k + halfLen] = uR - vR
-                    imag[i + k + halfLen] = uI - vI
-
-                    val nextWR = wR * wStepR - wI * wStepI
-                    val nextWI = wR * wStepI + wI * wStepR
-                    wR = nextWR
-                    wI = nextWI
-                }
-                i += len
-            }
-            len *= 2
-        }
+        return cachedResult
     }
 }

@@ -83,9 +83,9 @@ fun MainScreen(viewModel: LbjViewModel) {
             TopAppBar(
                 title = {
                     Text(
-                        text = "SDR-LBJ 列车无线电接收器",
+                        text = "SDR-LBJ (列车报警器) 信号接收和解析器",
                         color = TextPrimary,
-                        fontSize = 18.sp,
+                        fontSize = 17.sp,
                         fontWeight = FontWeight.Bold
                     )
                 },

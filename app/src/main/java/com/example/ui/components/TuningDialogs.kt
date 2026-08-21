@@ -1,13 +1,19 @@
 package com.example.ui.components
 
+import android.widget.Toast
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -17,7 +23,11 @@ import androidx.compose.foundation.text.ClickableText
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Code
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Link
+import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
@@ -40,8 +50,13 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -52,6 +67,7 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.decoder.ArrivalEstimator
 import com.example.dsp.DspConstants
 import com.example.ui.theme.BorderLight
 import com.example.ui.theme.EmeraldGreen
@@ -60,6 +76,7 @@ import com.example.ui.theme.PrimaryBlueDark
 import com.example.ui.theme.PrimaryBlueSoft
 import com.example.ui.theme.RedAlert
 import com.example.ui.theme.SurfaceCard
+import com.example.ui.theme.SurfaceSecondary
 import com.example.ui.theme.TextMuted
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
@@ -413,7 +430,13 @@ fun RouteStationKmDialog(
     onConfirm: (String, Double) -> Unit
 ) {
     var routeText by remember { mutableStateOf(initialRoute) }
-    var kmText by remember { mutableStateOf(if (initialKm != null) String.format(Locale.US, "%.1f", initialKm) else "") }
+    var kmText by remember {
+        mutableStateOf(
+            if (initialKm != null) ArrivalEstimator.formatMilestone(initialKm) else ""
+        )
+    }
+
+    val parsedKm = ArrivalEstimator.parseMilestone(kmText)
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -424,7 +447,7 @@ fun RouteStationKmDialog(
         text = {
             Column {
                 Text(
-                    text = "设置您所在位置对于指定线路的公里标 (如: 京沪高铁=145.8)，以便精确计算列车到达时间与距离。",
+                    text = "支持里程标写法 (如 K145+800、K1300+200) 或纯数字公里数 (如 145.8)，以便精确计算列车到达时间与距离。",
                     color = TextSecondary,
                     fontSize = 12.sp
                 )
@@ -440,22 +463,34 @@ fun RouteStationKmDialog(
                 OutlinedTextField(
                     value = kmText,
                     onValueChange = { kmText = it },
-                    label = { Text("本站公里标 KM (如: 145.8)") },
+                    label = { Text("本站公里标 / 里程标 (如: K1300+200 或 1300.2)") },
                     singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                     modifier = Modifier.fillMaxWidth()
                 )
+                if (kmText.isNotBlank()) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = if (parsedKm != null) {
+                            "✔ 解析结果: ${ArrivalEstimator.formatMilestoneWithKm(parsedKm)}"
+                        } else {
+                            "✖ 格式无法解析，请输入如 K145+800 或 145.8"
+                        },
+                        color = if (parsedKm != null) EmeraldGreen else RedAlert,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
             }
         },
         confirmButton = {
             Button(
                 onClick = {
                     val r = routeText.trim()
-                    val km = kmText.toDoubleOrNull()
-                    if (r.isNotEmpty() && km != null) {
-                        onConfirm(r, km)
+                    if (r.isNotEmpty() && parsedKm != null) {
+                        onConfirm(r, parsedKm)
                     }
                 },
+                enabled = routeText.isNotBlank() && parsedKm != null,
                 colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue)
             ) {
                 Text("保存", color = Color.White, fontWeight = FontWeight.Bold)
@@ -640,6 +675,245 @@ fun SignalLossDialog(
                 colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue)
             ) {
                 Text("我知道了", color = Color.White, fontWeight = FontWeight.Bold)
+            }
+        }
+    )
+}
+
+@Composable
+fun AboutAppDialog(onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    val clipboardManager = LocalClipboardManager.current
+
+    val copyToClipboard: (String, String) -> Unit = { text, label ->
+        clipboardManager.setText(AnnotatedString(text))
+        Toast.makeText(context, "已复制 $label 到剪贴板", Toast.LENGTH_SHORT).show()
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = SurfaceCard,
+        title = null,
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Spacer(modifier = Modifier.height(8.dp))
+                // App Launcher Icon
+                Image(
+                    painter = painterResource(id = com.example.R.mipmap.ic_launcher),
+                    contentDescription = "App Icon",
+                    modifier = Modifier
+                        .size(72.dp)
+                        .clip(RoundedCornerShape(16.dp))
+                        .border(1.dp, BorderLight, RoundedCornerShape(16.dp))
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "SDR-LBJ (列车报警器)",
+                    color = PrimaryBlueDark,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    text = "v1.0.0 (Build 1)",
+                    color = TextMuted,
+                    fontSize = 12.sp,
+                    fontFamily = FontFamily.Monospace
+                )
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // Author Info
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(SurfaceSecondary, RoundedCornerShape(10.dp))
+                        .border(1.dp, BorderLight, RoundedCornerShape(10.dp))
+                        .padding(12.dp)
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.Person,
+                                contentDescription = null,
+                                tint = PrimaryBlue,
+                                modifier = Modifier.size(18.dp).padding(end = 4.dp)
+                            )
+                            Text(
+                                text = "作者：B站/知乎@HurricaneDD",
+                                color = TextPrimary,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { copyToClipboard("1727364668", "QQ号") }
+                                .padding(vertical = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = "QQ：1727364668",
+                                color = TextPrimary,
+                                fontSize = 13.sp,
+                                fontFamily = FontFamily.Monospace
+                            )
+                            Icon(
+                                imageVector = Icons.Default.ContentCopy,
+                                contentDescription = "Copy",
+                                tint = PrimaryBlue,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // Personal Website Card (Clickable to copy)
+                val websiteUrl = "https://hurricanedd.github.io"
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(PrimaryBlueSoft)
+                        .border(1.dp, PrimaryBlue.copy(alpha = 0.3f), RoundedCornerShape(10.dp))
+                        .clickable { copyToClipboard(websiteUrl, "个人网站链接") }
+                        .padding(12.dp)
+                ) {
+                    Column {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(
+                                    imageVector = Icons.Default.Link,
+                                    contentDescription = null,
+                                    tint = PrimaryBlueDark,
+                                    modifier = Modifier.size(16.dp).padding(end = 4.dp)
+                                )
+                                Text(
+                                    text = "个人网站 (点击复制)：",
+                                    color = PrimaryBlueDark,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                            Icon(
+                                imageVector = Icons.Default.ContentCopy,
+                                contentDescription = "Copy",
+                                tint = PrimaryBlueDark,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = websiteUrl,
+                            color = PrimaryBlueDark,
+                            fontSize = 12.sp,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // Github Repo Card (Clickable to copy)
+                val githubUrl = "https://github.com/HurricaneDD/RTL_SDR_LBJ_RECEIVER_Android"
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(SurfaceSecondary)
+                        .border(1.dp, BorderLight, RoundedCornerShape(10.dp))
+                        .clickable { copyToClipboard(githubUrl, "Github仓库地址") }
+                        .padding(12.dp)
+                ) {
+                    Column {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(
+                                    imageVector = Icons.Default.Code,
+                                    contentDescription = null,
+                                    tint = TextPrimary,
+                                    modifier = Modifier.size(16.dp).padding(end = 4.dp)
+                                )
+                                Text(
+                                    text = "Github仓库地址 (点击复制)：",
+                                    color = TextPrimary,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                            Icon(
+                                imageVector = Icons.Default.ContentCopy,
+                                contentDescription = "Copy",
+                                tint = PrimaryBlue,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = githubUrl,
+                            color = PrimaryBlue,
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                            lineHeight = 15.sp
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // Acknowledgement Card (Clickable to copy ref link)
+                val refUrl = "https://github.com/Sdr-Is-Fun/RTL_SDR_LBJ_RECEIVER"
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(SurfaceSecondary)
+                        .border(1.dp, BorderLight, RoundedCornerShape(10.dp))
+                        .clickable { copyToClipboard(refUrl, "参考项目链接") }
+                        .padding(12.dp)
+                ) {
+                    Column {
+                        Text(
+                            text = "致谢与开发说明：",
+                            color = TextSecondary,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "本项目参考了 https://github.com/Sdr-Is-Fun/RTL_SDR_LBJ_RECEIVER 内的Python脚本，主体由Google AI Studio的Gemini模型完成开发。",
+                            color = TextSecondary,
+                            fontSize = 11.sp,
+                            lineHeight = 16.sp
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = onDismiss,
+                colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue)
+            ) {
+                Text("关闭", color = Color.White, fontWeight = FontWeight.Bold)
             }
         }
     )

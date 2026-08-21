@@ -129,8 +129,23 @@ class LbjViewModel(application: Application) : AndroidViewModel(application) {
         // Load initial route KM mappings from Room
         viewModelScope.launch(Dispatchers.IO) {
             val list = dao.getAllRouteStationKmsList()
-            for (item in list) {
-                arrivalEstimator.setRouteKm(item.routeName, item.stationKm)
+            if (list.isEmpty()) {
+                val defaults = listOf(
+                    RouteStationKmEntity("京沪高铁", 145.8, System.currentTimeMillis()),
+                    RouteStationKmEntity("京沪线", 1300.2, System.currentTimeMillis()),
+                    RouteStationKmEntity("陇海线", 250.0, System.currentTimeMillis()),
+                    RouteStationKmEntity("京津城际", 80.0, System.currentTimeMillis()),
+                    RouteStationKmEntity("京九线", 350.0, System.currentTimeMillis()),
+                    RouteStationKmEntity("杭深线", 120.0, System.currentTimeMillis())
+                )
+                for (d in defaults) {
+                    dao.insertRouteStationKm(d)
+                    arrivalEstimator.setRouteKm(d.routeName, d.stationKm)
+                }
+            } else {
+                for (item in list) {
+                    arrivalEstimator.setRouteKm(item.routeName, item.stationKm)
+                }
             }
         }
 
@@ -264,10 +279,21 @@ class LbjViewModel(application: Application) : AndroidViewModel(application) {
 
     private suspend fun runDspLoop(isSimulation: Boolean) {
         val resetAfcOnRelease = true
+        var lastUiUpdateTime = 0L
+        var nextSimTime = System.currentTimeMillis()
 
         while (viewModelScope.isActive && _receiverState.value.isRunning) {
             val iq = if (isSimulation) {
-                delay(65) // match 65536 samples @ 960kS/s (~68ms)
+                val now = System.currentTimeMillis()
+                val waitMs = nextSimTime - now
+                if (waitMs > 0) {
+                    delay(waitMs)
+                }
+                if (nextSimTime < now - 150L) {
+                    nextSimTime = now + 68L
+                } else {
+                    nextSimTime += 68L
+                }
                 simulator.generateBlock()
             } else {
                 val block = withContext(Dispatchers.IO) {
@@ -341,24 +367,29 @@ class LbjViewModel(application: Application) : AndroidViewModel(application) {
                 rtlClient.recycleBuffer(iq)
             }
 
-            // Update UI state
-            val curRoute = _liveTelemetry.value.route
-            val routeKm = arrivalEstimator.getKmForRoute(curRoute)
-            val routeKmText = if (routeKm != null) ArrivalEstimator.formatKm(routeKm) else "未设置"
+            // Update UI state with 100ms throttle to prevent UI thread starvation on older Android devices
+            val nowMs = System.currentTimeMillis()
+            val stateChanged = rssiGate.justActivated || rssiGate.justDeactivated
+            if (stateChanged || nowMs - lastUiUpdateTime >= 100L) {
+                lastUiUpdateTime = nowMs
+                val curRoute = _liveTelemetry.value.route
+                val routeKm = arrivalEstimator.getKmForRoute(curRoute)
+                val routeKmText = if (routeKm != null) ArrivalEstimator.formatKm(routeKm) else "未设置"
 
-            _receiverState.value = _receiverState.value.copy(
-                rssiDb = dspRes.rssiDb,
-                rssiGateState = rssiGate.state,
-                rssiHoldMs = rssiGate.holdLeftMs,
-                afcHz = dspFrontend.afc.afcHz,
-                afcErrHz = dspFrontend.afc.lastErrHz,
-                afcScore = dspFrontend.afc.lastScore,
-                spectrumBars = fftRes.bandsDb,
-                peakFreqHz = fftRes.peakInfo.peakFreqHz,
-                peakDeltaHz = fftRes.peakInfo.peakDeltaHz,
-                peakDb = fftRes.peakInfo.peakDb,
-                currentRouteStationKmText = routeKmText
-            )
+                _receiverState.value = _receiverState.value.copy(
+                    rssiDb = dspRes.rssiDb,
+                    rssiGateState = rssiGate.state,
+                    rssiHoldMs = rssiGate.holdLeftMs,
+                    afcHz = dspFrontend.afc.afcHz,
+                    afcErrHz = dspFrontend.afc.lastErrHz,
+                    afcScore = dspFrontend.afc.lastScore,
+                    spectrumBars = fftRes.bandsDb.clone(),
+                    peakFreqHz = fftRes.peakInfo.peakFreqHz,
+                    peakDeltaHz = fftRes.peakInfo.peakDeltaHz,
+                    peakDb = fftRes.peakInfo.peakDb,
+                    currentRouteStationKmText = routeKmText
+                )
+            }
         }
     }
 
@@ -436,6 +467,7 @@ class LbjViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setRouteStationKm(routeName: String, stationKm: Double) {
         arrivalEstimator.setRouteKm(routeName, stationKm)
+        recomputeEta()
         viewModelScope.launch(Dispatchers.IO) {
             dao.insertRouteStationKm(
                 RouteStationKmEntity(
@@ -449,8 +481,25 @@ class LbjViewModel(application: Application) : AndroidViewModel(application) {
 
     fun deleteRouteStationKm(routeName: String) {
         arrivalEstimator.removeRouteKm(routeName)
+        recomputeEta()
         viewModelScope.launch(Dispatchers.IO) {
             dao.deleteRouteStationKm(routeName)
+        }
+    }
+
+    private fun recomputeEta() {
+        val t = _liveTelemetry.value
+        if (t.trainNo != "----") {
+            val eta = arrivalEstimator.estimate(
+                train = t.trainNo,
+                direction = t.direction,
+                speedStr = t.speed,
+                positionStr = t.positionKm,
+                routeStr = t.route,
+                goodData = true,
+                nowEpochMs = System.currentTimeMillis()
+            )
+            _liveEta.value = eta
         }
     }
 

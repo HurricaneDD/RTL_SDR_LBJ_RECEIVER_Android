@@ -4,6 +4,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.regex.Pattern
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.round
 
@@ -37,16 +38,71 @@ class ArrivalEstimator(
         }
 
         fun formatKm(km: Double?): String {
-            return if (km != null) String.format(Locale.US, "%06.1fKM", km) else "---"
+            return if (km != null) String.format(Locale.US, "%.1f KM", km) else "---"
+        }
+
+        /**
+         * Parses railway milestone string, e.g.:
+         * "K1300+200" -> 1300.2
+         * "k145+800"  -> 145.8
+         * "1300+200"  -> 1300.2
+         * "K1300"     -> 1300.0
+         * "145.8"     -> 145.8
+         * "145.8KM"   -> 145.8
+         */
+        fun parseMilestone(v: Any?): Double? {
+            if (v == null) return null
+            val raw = v.toString().trim().uppercase()
+                .replace("KM", "")
+                .replace("公里", "")
+                .replace("千米", "")
+                .replace("米", "")
+                .trim()
+            if (raw.isEmpty() || raw in listOf("---", "---.-", "----", "未知")) return null
+
+            val withoutK = if (raw.startsWith("K")) raw.substring(1).trim() else raw
+
+            // Milestone format with '+' (e.g. 1300+200)
+            if (withoutK.contains('+')) {
+                val parts = withoutK.split('+')
+                if (parts.size == 2) {
+                    val kmPart = parts[0].trim().toDoubleOrNull() ?: return null
+                    val mStr = parts[1].trim()
+                    val mVal = mStr.toDoubleOrNull() ?: return null
+                    // If user enters +200 -> 200m (0.2km), +80 -> 80m, +8 -> 800m or 8m? Standard: mVal / 1000.0
+                    val total = kmPart + (mVal / 1000.0)
+                    if (total < 0.0 || total > 99999.9) return null
+                    return round(total * 1000.0) / 1000.0
+                }
+            }
+
+            val direct = withoutK.toDoubleOrNull() ?: return null
+            if (direct < 0.0 || direct > 99999.9) return null
+            return round(direct * 1000.0) / 1000.0
         }
 
         fun parseKm(v: Any?): Double? {
-            if (v == null) return null
-            val s = v.toString().uppercase().replace("KM", "").trim()
-            if (s.isEmpty() || s in listOf("---", "---.-", "----")) return null
-            val km = s.toDoubleOrNull() ?: return null
-            if (km < 0.0 || km > 9999.9) return null
-            return round(km * 10.0) / 10.0
+            return parseMilestone(v)
+        }
+
+        /**
+         * Formats kilometer double to railway milestone format, e.g.:
+         * 1300.2 -> "K1300+200"
+         * 145.8  -> "K145+800"
+         * 1300.0 -> "K1300+000"
+         */
+        fun formatMilestone(km: Double?): String {
+            if (km == null) return "---"
+            val wholeKm = km.toInt()
+            val m = round((km - wholeKm) * 1000.0).toInt().coerceIn(0, 999)
+            return String.format(Locale.US, "K%d+%03d", wholeKm, m)
+        }
+
+        fun formatMilestoneWithKm(km: Double?): String {
+            if (km == null) return "---"
+            val wholeKm = km.toInt()
+            val m = round((km - wholeKm) * 1000.0).toInt().coerceIn(0, 999)
+            return String.format(Locale.US, "K%d+%03d (%.1f KM)", wholeKm, m, km)
         }
 
         fun isRouteValid(route: String?): Boolean {
@@ -72,8 +128,28 @@ class ArrivalEstimator(
 
     fun getKmForRoute(route: String?): Double? {
         val r = sanitizeRoute(route)
-        if (r.isNotEmpty() && routeKmMap.containsKey(r)) {
-            return routeKmMap[r]
+        if (r.isNotEmpty()) {
+            // 1. Exact match
+            if (routeKmMap.containsKey(r)) {
+                return routeKmMap[r]
+            }
+            // 2. Fuzzy match (e.g. "京沪" in "京沪高铁", "京沪线" vs "京沪高铁")
+            val cleanR = r.replace("高铁", "").replace("客专", "").replace("铁路", "").replace("城际", "").replace("线", "").trim()
+            for ((key, km) in routeKmMap) {
+                if (r == key || r.contains(key) || key.contains(r)) {
+                    return km
+                }
+                val cleanKey = key.replace("高铁", "").replace("客专", "").replace("铁路", "").replace("城际", "").replace("线", "").trim()
+                if (cleanR.isNotEmpty() && cleanKey.isNotEmpty()) {
+                    if (cleanR == cleanKey || cleanR.contains(cleanKey) || cleanKey.contains(cleanR)) {
+                        return km
+                    }
+                }
+            }
+        }
+        // 3. If there is only one route configured by the user, use it as default fallback
+        if (routeKmMap.size == 1) {
+            return routeKmMap.values.first()
         }
         return defaultKm
     }
@@ -111,7 +187,7 @@ class ArrivalEstimator(
         if (!goodData) {
             return EtaInfo(etaStatus = "错包忽略", etaTrain = train ?: "----", etaRoute = route)
         }
-        if (route.isEmpty()) {
+        if (route.isEmpty() && routeKmMap.size != 1 && defaultKm == null) {
             return EtaInfo(etaStatus = "线路未知", etaTrain = train ?: "----", etaRoute = "----")
         }
 
@@ -126,12 +202,11 @@ class ArrivalEstimator(
         }
 
         val speed = speedStr?.replace("km/h", "")?.trim()?.toDoubleOrNull()
-        if (speed == null || speed <= 0.0) {
-            return EtaInfo(etaStatus = "速度无效", etaTrain = train, etaRoute = route)
-        }
-
         val trainKm = parseKm(positionStr)
-            ?: return EtaInfo(etaStatus = "公里标无效", etaTrain = train, etaRoute = route)
+
+        if (trainKm == null) {
+            return EtaInfo(etaStatus = "公里标未知", etaTrain = train, etaRoute = route)
+        }
 
         val distanceKm = if (downIncreases) {
             if (direction == "下行") userKm - trainKm else trainKm - userKm
@@ -139,8 +214,26 @@ class ArrivalEstimator(
             if (direction == "下行") trainKm - userKm else userKm - trainKm
         }
 
-        if (distanceKm < -0.02) {
-            return EtaInfo(etaStatus = "远离/已过", etaTrain = train, etaRoute = route, etaDistanceKm = distanceKm)
+        if (distanceKm < -0.05) {
+            return EtaInfo(
+                etaSeconds = null,
+                etaTime = "--:--:--",
+                etaDistanceKm = abs(distanceKm),
+                etaStatus = "远离/已过",
+                etaTrain = train,
+                etaRoute = route
+            )
+        }
+
+        if (speed == null || speed <= 0.0) {
+            return EtaInfo(
+                etaSeconds = null,
+                etaTime = "--:--:--",
+                etaDistanceKm = max(0.0, distanceKm),
+                etaStatus = "停靠/静止",
+                etaTrain = train,
+                etaRoute = route
+            )
         }
 
         val nonNegDistance = max(0.0, distanceKm)
@@ -157,7 +250,11 @@ class ArrivalEstimator(
         }
 
         val etaTime = timeFormat.format(Date(nowEpochMs + (etaSec * 1000).toLong()))
-        val status = if (etaSec <= 10.0) "即将到达" else "接近"
+        val status = when {
+            etaSec <= 15.0 || nonNegDistance <= 0.3 -> "即将到达"
+            etaSec <= 300.0 -> "接近 (5分内)"
+            else -> "接近中"
+        }
 
         return EtaInfo(
             etaSeconds = etaSec,
@@ -169,3 +266,4 @@ class ArrivalEstimator(
         )
     }
 }
+

@@ -14,7 +14,7 @@ android {
   compileSdk { version = release(36) { minorApiLevel = 1 } }
 
   defaultConfig {
-    applicationId = "com.aistudio.sdrlbj.tqzr"
+    applicationId = "org.hurricanedd.rtlsdrlbj"
     minSdk = 21
     targetSdk = 36
     versionCode = 1

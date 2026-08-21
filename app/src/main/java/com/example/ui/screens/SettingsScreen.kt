@@ -51,6 +51,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.driver.DriverLauncher
 import com.example.ui.ReceiverState
+import com.example.ui.components.AboutAppDialog
 import com.example.ui.theme.AmberSignal
 import com.example.ui.theme.BorderLight
 import com.example.ui.theme.PrimaryBlue
@@ -83,6 +84,11 @@ fun SettingsScreen(
     val scrollState = rememberScrollState()
     val context = LocalContext.current
     var showResetDialog by remember { mutableStateOf(false) }
+    var showAboutDialog by remember { mutableStateOf(false) }
+
+    if (showAboutDialog) {
+        AboutAppDialog(onDismiss = { showAboutDialog = false })
+    }
 
     Column(
         modifier = modifier
@@ -118,6 +124,13 @@ fun SettingsScreen(
                     subtitle = "成功解析到列车信号或车次变更时播放2秒滴滴警示音",
                     checked = state.alertToneEnabled,
                     onCheckedChange = onToggleAlertTone
+                )
+
+                SettingsItem(
+                    title = "关于本应用",
+                    subtitle = "作者信息、项目开源仓库及开发致谢说明",
+                    value = "查看",
+                    onClick = { showAboutDialog = true }
                 )
 
                 SettingsItem(
