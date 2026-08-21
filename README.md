@@ -1,6 +1,6 @@
 # RTL SDR_LBJ_RECEIVER_Android
 ## 致谢和免责
-本项目参考了 [FLN1021/SX1276_Receive_LBJ。](https://github.com/Sdr-Is-Fun/RTL_SDR_LBJ_RECEIVER/tree/main)
+本项目参考了 [FLN1021/SX1276_Receive_LBJ](https://github.com/Sdr-Is-Fun/RTL_SDR_LBJ_RECEIVER/tree/main)，使用了Google Gemini 模型进行开发。
 
 本项目基于 GNU GPL 开源。发布或分发基于本项目的修改版本时，应遵循相同协议开源。
 
